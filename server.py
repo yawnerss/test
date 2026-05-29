@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Flask web interface for the raw HTTP GET stress tester.
-Run on a port of your choice (default 5000).
+Flask web interface for raw HTTP GET stress tester – optimized for low memory (512 MB RAM).
 """
 
 import asyncio
@@ -11,10 +10,11 @@ import threading
 from flask import Flask, render_template_string, request, jsonify
 from urllib.parse import urlparse
 
-# ---------- Hardcoded settings ----------
+# ---------- Low‑memory settings ----------
 DURATION_SECONDS = 9000           # Test runs for 9000 seconds when launched
-CONCURRENCY = 100                 # Number of parallel workers
+CONCURRENCY = 20                  # Reduced from 100 to save memory/connections
 CONNECTION_TIMEOUT = 5.0          # Seconds per request timeout
+MAX_LOG_LINES = 50                # Keep only last 50 log lines
 # ----------------------------------------
 
 # Global state for the running test
@@ -24,11 +24,11 @@ stats = {
     "total": 0,
     "success": 0,
     "error": 0,
-    "avg_latency_ms": 0,
-    "current_rps": 0,
+    "avg_latency_ms": 0.0,
+    "current_rps": 0.0,
     "target": "",
     "running": False,
-    "log": []                      # store last 200 log lines
+    "log": []                      # will store at most MAX_LOG_LINES
 }
 
 app = Flask(__name__)
@@ -38,15 +38,16 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <title>Stress Tester – Raw HTTP GET</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: monospace; margin: 2em; background: #f5f5f5; }
-        .container { max-width: 900px; margin: auto; background: white; padding: 2em; border-radius: 8px; }
+        body { font-family: monospace; margin: 1em; background: #f5f5f5; }
+        .container { max-width: 900px; margin: auto; background: white; padding: 1em; border-radius: 8px; }
         input, button { padding: 0.5em; font-size: 1em; }
         input { width: 70%; }
         button { margin-left: 1em; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
         button:disabled { background: #aaa; cursor: not-allowed; }
         .stats { background: #e9ecef; padding: 1em; border-radius: 5px; margin: 1em 0; }
-        .log { background: #212529; color: #0f0; padding: 1em; border-radius: 5px; height: 300px; overflow-y: scroll; font-size: 0.85em; }
+        .log { background: #212529; color: #0f0; padding: 1em; border-radius: 5px; height: 250px; overflow-y: scroll; font-size: 0.8em; }
         .error { color: red; }
         .ok { color: green; }
     </style>
@@ -62,11 +63,7 @@ HTML_TEMPLATE = """
                     document.getElementById('latency').innerText = data.avg_latency_ms;
                     document.getElementById('target_display').innerText = data.target;
                     document.getElementById('running_status').innerHTML = data.running ? '<span class="ok">RUNNING</span>' : '<span class="error">IDLE</span>';
-                    if (!data.running) {
-                        document.getElementById('launchBtn').disabled = false;
-                    } else {
-                        document.getElementById('launchBtn').disabled = true;
-                    }
+                    document.getElementById('launchBtn').disabled = data.running;
                 });
         }
         function updateLog() {
@@ -122,22 +119,23 @@ HTML_TEMPLATE = """
         <strong>Avg Latency:</strong> <span id="latency">0.0</span> ms
     </div>
     <div class="log" id="log">Waiting for test...</div>
-    <p><small>⚠️ The test will run for exactly 9000 seconds (2.5 hours) once launched.<br>
-    Concurrency: 100 workers, raw sockets (no certificate verification for HTTPS).</small></p>
+    <p><small>⚠️ Test runs 9000 seconds (2.5h). Concurrency: 20 workers. Low‑memory mode.<br>
+    Raw sockets, no SSL verification.</small></p>
 </div>
 </body>
 </html>
 """
 
 def add_log(msg):
-    """Store log lines (last 200)"""
-    stats["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    if len(stats["log"]) > 200:
+    """Store log lines with size limit."""
+    log_entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    stats["log"].append(log_entry)
+    if len(stats["log"]) > MAX_LOG_LINES:
         stats["log"].pop(0)
-    print(msg)  # also print to console
+    print(log_entry)  # also print to console for Render logs
 
 # -----------------------------------------------------------------
-# Stress test engine (identical to previous, but adapted for logging)
+# Optimized stress engine – no latency list, incremental average
 # -----------------------------------------------------------------
 async def raw_get(request_id, host, port, use_ssl, path, timeout):
     start = time.monotonic()
@@ -175,25 +173,27 @@ async def raw_get(request_id, host, port, use_ssl, path, timeout):
             await writer.wait_closed()
 
 async def stress_worker(worker_id, stop_event, host, port, use_ssl, path, timeout, stats_local):
-    """Worker that pushes updates into a shared stats dict"""
+    """Worker that updates local stats dict (no global locks)."""
     while not stop_event.is_set():
         latency, status = await raw_get(worker_id, host, port, use_ssl, path, timeout)
+        # Update local stats
         stats_local["total"] += 1
         if latency is not None and 200 <= status < 400:
             stats_local["success"] += 1
-            # update moving average latency
-            total_success = stats_local["success"]
+            # Incremental average update
+            success_cnt = stats_local["success"]
             old_avg = stats_local["avg_latency_ms"]
-            new_avg = old_avg + (latency*1000 - old_avg) / total_success
+            new_avg = old_avg + (latency * 1000 - old_avg) / success_cnt
             stats_local["avg_latency_ms"] = new_avg
             add_log(f"Req #{stats_local['total']} -> {status} OK ({latency*1000:.1f}ms)")
         else:
             stats_local["error"] += 1
             add_log(f"Req #{stats_local['total']} -> FAILED (timeout/error)")
+        # Tiny sleep to avoid event loop starvation
         await asyncio.sleep(0)
 
 async def stress_runner(target_url, duration_sec, concurrency, timeout):
-    """Main async routine that runs the test and updates RPS."""
+    """Main async routine, updates global stats every second."""
     parsed = urlparse(target_url)
     host = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -210,24 +210,23 @@ async def stress_runner(target_url, duration_sec, concurrency, timeout):
         "avg_latency_ms": 0.0,
     }
 
-    # Launch workers
+    # Create workers
     workers = [
         asyncio.create_task(stress_worker(i, stop_event, host, port, use_ssl, path, timeout, stats_local))
         for i in range(concurrency)
     ]
 
-    # RPS reporter (updates global stats every second)
     start_time = time.monotonic()
     last_total = 0
     last_time = start_time
     while time.monotonic() - start_time < duration_sec and not stop_event.is_set():
-        await asyncio.sleep(1)
+        await asyncio.sleep(1)   # update every second
         now = time.monotonic()
         total_now = stats_local["total"]
         delta_req = total_now - last_total
         delta_time = now - last_time
         current_rps = delta_req / delta_time if delta_time > 0 else 0
-        # Update global stats for web UI
+        # Copy to global stats (atomic for simple types)
         stats["total"] = stats_local["total"]
         stats["success"] = stats_local["success"]
         stats["error"] = stats_local["error"]
@@ -236,7 +235,7 @@ async def stress_runner(target_url, duration_sec, concurrency, timeout):
         last_total = total_now
         last_time = now
 
-    # Stop workers and wait
+    # Stop workers
     stop_event.set()
     await asyncio.gather(*workers, return_exceptions=True)
 
@@ -249,15 +248,15 @@ async def stress_runner(target_url, duration_sec, concurrency, timeout):
     add_log(f"Test finished. Total: {stats_local['total']}, OK: {stats_local['success']}, ERR: {stats_local['error']}")
 
 def run_stress_test(target_url):
-    """Run the async stress test in a new event loop (called in a background thread)."""
+    """Run the async stress test in a new event loop (background thread)."""
     global test_running, stats
     stats["running"] = True
     stats["target"] = target_url
     stats["total"] = 0
     stats["success"] = 0
     stats["error"] = 0
-    stats["avg_latency_ms"] = 0
-    stats["current_rps"] = 0
+    stats["avg_latency_ms"] = 0.0
+    stats["current_rps"] = 0.0
     stats["log"] = []
     add_log(f"🚀 Launching stress test on {target_url} for {DURATION_SECONDS} seconds")
     try:
@@ -301,7 +300,6 @@ def api_start():
     target = data.get("target", "").strip()
     if not target or (not target.startswith("http://") and not target.startswith("https://")):
         return jsonify({"status": "error", "message": "Invalid URL. Use http:// or https://"}), 400
-    # Validate host resolution
     try:
         parsed = urlparse(target)
         if not parsed.hostname:
@@ -317,4 +315,5 @@ def api_start():
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    # Use debug=False, threaded=False to reduce memory overhead
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
